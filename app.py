@@ -2,8 +2,10 @@
 Free and fully offline (RapidOCR / PaddleOCR models via ONNX).
 Run:  streamlit run app.py
 """
+import base64
 import hashlib
 import io
+import logging
 import re
 from datetime import date
 from pathlib import Path
@@ -15,6 +17,209 @@ import streamlit as st
 from dateutil import parser as dateparser
 from PIL import Image, ImageOps
 from rapidocr_onnxruntime import RapidOCR
+
+LOGGER = logging.getLogger(__name__)
+
+
+REAR_CAMERA_HTML = """
+<div class="camera-shell">
+  <div class="camera-view">
+    <video id="camera-video" autoplay playsinline muted></video>
+    <div id="camera-guide" aria-hidden="true"></div>
+    <p id="camera-status" role="status">Starting the rear camera…</p>
+  </div>
+  <div class="camera-actions">
+    <button id="capture-button" class="capture-button" type="button" disabled>
+      <span aria-hidden="true">●</span> Capture receipt
+    </button>
+    <button id="switch-button" class="switch-button" type="button" disabled>
+      Switch camera
+    </button>
+  </div>
+  <canvas id="camera-canvas" hidden></canvas>
+</div>
+"""
+
+REAR_CAMERA_CSS = """
+:host {
+  display: block;
+  width: 100%;
+  color: var(--st-text-color);
+  font-family: var(--st-font);
+}
+.camera-shell { width: 100%; }
+.camera-view {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--st-text-color) 18%, transparent);
+  border-radius: var(--st-border-radius-lg, 14px);
+  background: #101114;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
+}
+#camera-video {
+  display: block;
+  width: 100%;
+  height: min(68svh, 720px);
+  min-height: 420px;
+  object-fit: contain;
+  background: #101114;
+}
+#camera-guide {
+  position: absolute;
+  inset: 7% 8%;
+  pointer-events: none;
+  border: 2px solid rgba(255, 255, 255, 0.78);
+  border-radius: 12px;
+  box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.08);
+}
+#camera-status {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 10px;
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.62);
+  font-size: 0.88rem;
+  text-align: center;
+}
+.camera-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 10px;
+  margin-top: 12px;
+}
+.camera-actions button {
+  min-height: 48px;
+  padding: 10px 14px;
+  border-radius: var(--st-border-radius, 8px);
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+.camera-actions button:disabled { cursor: not-allowed; opacity: 0.55; }
+.capture-button {
+  border: 1px solid var(--st-primary-color);
+  color: var(--st-primary-button-text-color, #fff);
+  background: var(--st-primary-color);
+}
+.capture-button span { margin-right: 6px; }
+.switch-button {
+  border: 1px solid color-mix(in srgb, var(--st-text-color) 28%, transparent);
+  color: var(--st-text-color);
+  background: var(--st-secondary-background-color);
+}
+@media (max-width: 640px) {
+  #camera-video { height: 66svh; min-height: 430px; }
+  #camera-guide { inset: 5% 5%; }
+  .camera-actions { grid-template-columns: 1fr; }
+  .camera-actions button { width: 100%; min-height: 52px; }
+}
+"""
+
+REAR_CAMERA_JS = """
+const mountedCameras = new WeakMap();
+
+export default function cameraComponent(component) {
+  const { parentElement, setTriggerValue } = component;
+  const video = parentElement.querySelector("#camera-video");
+  const canvas = parentElement.querySelector("#camera-canvas");
+  const captureButton = parentElement.querySelector("#capture-button");
+  const switchButton = parentElement.querySelector("#switch-button");
+  const status = parentElement.querySelector("#camera-status");
+  if (!video || !canvas || !captureButton || !switchButton || !status) return;
+
+  let camera = mountedCameras.get(parentElement);
+  if (!camera) {
+    camera = { stream: null, devices: [], activeIndex: 0, stopped: false };
+    mountedCameras.set(parentElement, camera);
+  }
+
+  const stopStream = () => {
+    if (camera.stream) {
+      camera.stream.getTracks().forEach((track) => track.stop());
+      camera.stream = null;
+    }
+  };
+
+  const listCameras = async () => {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    camera.devices = devices.filter((device) => device.kind === "videoinput");
+    const rearIndex = camera.devices.findIndex((device) =>
+      /back|rear|environment/i.test(device.label)
+    );
+    if (rearIndex >= 0) camera.activeIndex = rearIndex;
+    switchButton.disabled = camera.devices.length < 2;
+  };
+
+  const startCamera = async (deviceId = null) => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      status.textContent = "Camera access is not supported in this browser. Use Upload batch instead.";
+      return;
+    }
+    stopStream();
+    captureButton.disabled = true;
+    status.hidden = false;
+    status.textContent = "Starting the rear camera…";
+
+    const videoConstraints = deviceId
+      ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      : { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } };
+
+    try {
+      camera.stream = await navigator.mediaDevices.getUserMedia({
+        video: videoConstraints,
+        audio: false,
+      });
+      video.srcObject = camera.stream;
+      await video.play();
+      await listCameras();
+      captureButton.disabled = false;
+      status.hidden = true;
+    } catch (error) {
+      status.hidden = false;
+      status.textContent = error?.name === "NotAllowedError"
+        ? "Camera permission was denied. Allow camera access or use Upload batch."
+        : "Could not open the camera. Use Upload batch or try another browser.";
+    }
+  };
+
+  captureButton.onclick = () => {
+    if (!video.videoWidth || !video.videoHeight) return;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext("2d", { alpha: false });
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    status.hidden = false;
+    status.textContent = "Photo captured. Preparing receipt…";
+    setTriggerValue("captured", canvas.toDataURL("image/jpeg", 0.94));
+  };
+
+  switchButton.onclick = async () => {
+    if (camera.devices.length < 2) return;
+    camera.activeIndex = (camera.activeIndex + 1) % camera.devices.length;
+    await startCamera(camera.devices[camera.activeIndex].deviceId);
+  };
+
+  if (!camera.stream && !camera.stopped) startCamera();
+
+  return () => {
+    camera.stopped = true;
+    stopStream();
+    mountedCameras.delete(parentElement);
+  };
+}
+"""
+
+REAR_CAMERA = st.components.v2.component(
+    "rear_receipt_camera",
+    html=REAR_CAMERA_HTML,
+    css=REAR_CAMERA_CSS,
+    js=REAR_CAMERA_JS,
+)
 
 RECORDS_DIR = Path("records")
 RECORDS_DIR.mkdir(exist_ok=True)
@@ -201,7 +406,11 @@ def process(data: bytes) -> dict:
     )
 
 # --- UI SETUP & CUSTOM STYLING ---
-st.set_page_config(page_title="Snap & Save", layout="centered")
+st.set_page_config(
+    page_title="Snap & Save",
+    page_icon=":material/receipt_long:",
+    layout="centered",
+)
 
 st.markdown("""
 <style>
@@ -225,6 +434,11 @@ st.markdown("""
         margin-bottom: 30px;
         font-size: 0.95rem;
     }
+    .stMainBlockContainer {
+        max-width: 920px;
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+    }
     /* Expander card UI styling */
     [data-testid="stExpander"] {
         border-radius: 12px;
@@ -242,6 +456,19 @@ st.markdown("""
     [data-testid="baseButton-primary"]:active {
         transform: scale(0.98);
     }
+    @media (max-width: 640px) {
+        .stMainBlockContainer {
+            padding: 0.75rem 0.75rem 2rem;
+        }
+        .main-header {
+            font-size: 2rem;
+            margin-bottom: -8px;
+        }
+        .sub-header {
+            margin-bottom: 18px;
+            font-size: 0.88rem;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -258,23 +485,41 @@ ss.setdefault("fmt", "xlsx")
 summary = st.empty()
 
 # Input Tabs
-tab_cam, tab_up = st.tabs(["Take Photo", "Upload Batch"])
+tab_cam, tab_up = st.tabs(["Take photo", "Upload batch"])
 
 with tab_cam:
-    st.info("Capture a clear, well-lit photo of the receipt.")
-    
-    # By tying the key to ss.cam_key, the widget resets immediately after processing a shot
-    shot = st.camera_input("Take a photo", label_visibility="collapsed", key=f"camera_input_{ss.cam_key}")
-    
-    if shot:
-        b = shot.getvalue()
-        file_hash = hashlib.md5(b).hexdigest()
-        
-        if file_hash not in ss.cam:
-            ss.cam[file_hash] = b
-            ss.cam_key += 1  # Increment to reset the camera UI
-            st.rerun()       # Force UI refresh to show clean camera instantly
-            
+    st.caption(
+        "Fill the guide with one clear, well-lit receipt. "
+        "The rear camera is preferred automatically."
+    )
+
+    camera_result = REAR_CAMERA(
+        key=f"rear_camera_{ss.cam_key}",
+        on_captured_change=lambda: None,
+        width="stretch",
+    )
+    captured = getattr(camera_result, "captured", None)
+
+    if captured:
+        try:
+            header, encoded = captured.split(",", 1)
+            if not header.startswith("data:image/"):
+                raise ValueError("Unexpected camera data")
+            b = base64.b64decode(encoded, validate=True)
+            if not b or len(b) > 20 * 1024 * 1024:
+                raise ValueError("Camera image is empty or too large")
+        except (ValueError, TypeError):
+            st.error(
+                "The camera returned an invalid image. "
+                "Please try again or use Upload batch."
+            )
+        else:
+            file_hash = hashlib.md5(b).hexdigest()
+            if file_hash not in ss.cam:
+                ss.cam[file_hash] = b
+                ss.cam_key += 1
+                st.rerun()
+
     if ss.cam:
         st.success(f"{len(ss.cam)} photo(s) queued for processing in this batch.")
 
@@ -300,16 +545,32 @@ st.divider()
 
 # Processing state
 results = {}
+failures = []
 progress_bar = st.progress(0.0)
 status_text = st.empty()
 
 for i, (h, (name, b)) in enumerate(batch.items(), 1):
     status_text.caption(f"Reading receipt {i} of {len(batch)}...")
-    results[h] = process(b)
+    try:
+        results[h] = process(b)
+    except Exception:
+        LOGGER.exception("Failed to process receipt %s", name)
+        failures.append(name)
     progress_bar.progress(i / len(batch))
 
 progress_bar.empty()
 status_text.empty()
+
+if failures:
+    for name in failures:
+        st.error(
+            f"Could not read {name}. "
+            "Retake it in good light or upload a different image."
+        )
+
+batch = {h: item for h, item in batch.items() if h in results}
+if not batch:
+    st.stop()
 
 final, n_checked, n_warn, grand = [], 0, 0, 0.0
 
@@ -330,7 +591,7 @@ for h, (name, b) in batch.items():
         include = st.checkbox(f"Include {name} in final save", value=True, key=f"inc_{h}")
         
         # Display image first on mobile (stacked)
-        st.image(Image.open(io.BytesIO(b)), use_container_width=True)
+        st.image(Image.open(io.BytesIO(b)), width="stretch")
         
         if not r["rows"]:
             st.error("No items detected. Try better lighting or add rows below.")
@@ -340,7 +601,7 @@ for h, (name, b) in batch.items():
         edited = st.data_editor(
             df,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             key=f"ed_{h}",
             column_config={
                 "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
@@ -379,7 +640,12 @@ with summary.container():
 st.divider()
 
 # Save Action (Full-width button)
-if st.button(f"Save {len(all_rows)} Item(s)", type="primary", disabled=all_rows.empty, use_container_width=True):
+if st.button(
+    f"Save {len(all_rows)} item(s)",
+    type="primary",
+    disabled=all_rows.empty,
+    width="stretch",
+):
     ss.saved = save(all_rows, ss.fmt)
     st.success(f"Saved successfully to {ss.saved}")
 
@@ -388,7 +654,7 @@ if ss.saved and Path(ss.saved).exists():
         label=f"Download {Path(ss.saved).name}",
         data=Path(ss.saved).read_bytes(),
         file_name=Path(ss.saved).name,
-        use_container_width=True
+        width="stretch",
     )
 
 # Advanced Settings

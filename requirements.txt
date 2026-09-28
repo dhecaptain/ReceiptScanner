@@ -1,7 +1,8 @@
 streamlit
 rapidocr-onnxruntime
+opencv-python==4.11.0.86
 pandas
 openpyxl
 python-dateutil
 pillow
-numpy
+numpy<2.3
