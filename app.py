@@ -1,5 +1,5 @@
 """Office purchase receipt scanner: capture -> OCR -> parse -> review -> save to CSV/XLSX.
-Free and fully offline (RapidOCR / PaddleOCR models via ONNX).
+Free and fully offline (Tesseract OCR).
 Run:  streamlit run app.py
 """
 import base64
@@ -10,13 +10,12 @@ import re
 from datetime import date
 from pathlib import Path
 
-import cv2
-import numpy as np
 import pandas as pd
+import pytesseract
 import streamlit as st
 from dateutil import parser as dateparser
-from PIL import Image, ImageOps
-from rapidocr_onnxruntime import RapidOCR
+from PIL import Image, ImageFilter, ImageOps
+from pytesseract import Output
 
 LOGGER = logging.getLogger(__name__)
 
@@ -241,53 +240,69 @@ DATE_PATTERNS = [
     r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{2,4}\b",
 ]
 
-@st.cache_resource
-def get_engine():
-    return RapidOCR()
-
-def preprocess(img: Image.Image) -> np.ndarray:
-    """Fix phone rotation, upscale small images, boost local contrast."""
-    img = ImageOps.exif_transpose(img).convert("RGB")
-    arr = np.array(img)
-    h, w = arr.shape[:2]
+def preprocess(img: Image.Image) -> Image.Image:
+    """Fix phone rotation, resize, and enhance contrast without native CV libraries."""
+    img = ImageOps.exif_transpose(img).convert("L")
+    w, h = img.size
     if max(h, w) < 1400:
         s = 1400 / max(h, w)
-        arr = cv2.resize(arr, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+        img = img.resize(
+            (max(1, round(w * s)), max(1, round(h * s))),
+            Image.Resampling.LANCZOS,
+        )
     elif max(h, w) > 2600:
         s = 2600 / max(h, w)
-        arr = cv2.resize(arr, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
-    l, a, b = cv2.split(lab)
-    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
-    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB)
-
-def ocr_lines(arr: np.ndarray):
-    """Run OCR and group word boxes into visual rows."""
-    result, _ = get_engine()(arr)
-    if not result:
-        return []
-    items = []
-    for box, text, conf in result:
-        xs = [p[0] for p in box]
-        ys = [p[1] for p in box]
-        items.append(
-            dict(x=min(xs), yc=sum(ys) / 4, h=max(ys) - min(ys), text=text.strip())
+        img = img.resize(
+            (max(1, round(w * s)), max(1, round(h * s))),
+            Image.Resampling.LANCZOS,
         )
-    items.sort(key=lambda d: d["yc"])
-    med_h = float(np.median([d["h"] for d in items])) or 20
-    rows, cur = [], [items[0]]
-    for d in items[1:]:
-        ref = sum(c["yc"] for c in cur) / len(cur)
-        if abs(d["yc"] - ref) <= 0.6 * med_h:
-            cur.append(d)
-        else:
-            rows.append(cur)
-            cur = [d]
-    rows.append(cur)
+    return ImageOps.autocontrast(img, cutoff=1).filter(ImageFilter.SHARPEN)
+
+
+def ocr_lines(img: Image.Image):
+    """Run Tesseract and return words grouped into their detected text rows."""
+    data = pytesseract.image_to_data(
+        img,
+        lang="eng",
+        config="--oem 1 --psm 6 -c preserve_interword_spaces=1",
+        output_type=Output.DICT,
+    )
+    grouped = {}
+    for i, raw_text in enumerate(data["text"]):
+        text = raw_text.strip()
+        try:
+            confidence = float(data["conf"][i])
+        except (TypeError, ValueError):
+            confidence = -1
+        if not text or confidence < 15:
+            continue
+        key = (
+            data["page_num"][i],
+            data["block_num"][i],
+            data["par_num"][i],
+            data["line_num"][i],
+        )
+        grouped.setdefault(key, []).append(
+            {
+                "x": int(data["left"][i]),
+                "y": int(data["top"][i]),
+                "text": text,
+            }
+        )
+
+    rows = sorted(
+        grouped.values(),
+        key=lambda row: (min(word["y"] for word in row), min(word["x"] for word in row)),
+    )
     out = []
-    for r in rows:
-        r.sort(key=lambda d: d["x"])
-        out.append((" ".join(d["text"] for d in r), [(d["x"], d["text"]) for d in r]))
+    for row in rows:
+        row.sort(key=lambda word: word["x"])
+        out.append(
+            (
+                " ".join(word["text"] for word in row),
+                [(word["x"], word["text"]) for word in row],
+            )
+        )
     return out
 
 def find_date(lines):

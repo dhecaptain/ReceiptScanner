@@ -6,11 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "streamlit",
-    "rapidocr-onnxruntime",
-    "opencv-python==4.11.0.86",
+    "pytesseract",
     "pandas",
     "openpyxl",
     "python-dateutil",
     "pillow",
-    "numpy<2.3",
 ]
