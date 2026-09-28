@@ -1,5 +1,7 @@
 streamlit
 pytesseract
+opencv-python-headless==4.11.0.86
+numpy<2.3
 pandas
 openpyxl
 python-dateutil

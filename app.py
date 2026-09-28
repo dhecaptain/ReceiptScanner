@@ -10,11 +10,13 @@ import re
 from datetime import date
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pandas as pd
 import pytesseract
 import streamlit as st
 from dateutil import parser as dateparser
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageOps
 from pytesseract import Output
 
 LOGGER = logging.getLogger(__name__)
@@ -25,6 +27,7 @@ REAR_CAMERA_HTML = """
   <div class="camera-view">
     <video id="camera-video" autoplay playsinline muted></video>
     <div id="camera-guide" aria-hidden="true"></div>
+    <p id="quality-indicator" class="quality waiting">Checking light and focus…</p>
     <p id="camera-status" role="status">Starting the rear camera…</p>
   </div>
   <div class="camera-actions">
@@ -85,6 +88,25 @@ REAR_CAMERA_CSS = """
   font-size: 0.88rem;
   text-align: center;
 }
+.quality {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  z-index: 2;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100% - 24px);
+  margin: 0;
+  padding: 7px 11px;
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.68);
+  font-size: 0.84rem;
+  font-weight: 650;
+  text-align: center;
+}
+.quality.good { background: rgba(24, 122, 72, 0.88); }
+.quality.warning { background: rgba(180, 83, 9, 0.92); }
 .camera-actions {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
@@ -129,18 +151,63 @@ export default function cameraComponent(component) {
   const captureButton = parentElement.querySelector("#capture-button");
   const switchButton = parentElement.querySelector("#switch-button");
   const status = parentElement.querySelector("#camera-status");
-  if (!video || !canvas || !captureButton || !switchButton || !status) return;
+  const quality = parentElement.querySelector("#quality-indicator");
+  if (!video || !canvas || !captureButton || !switchButton || !status || !quality) return;
 
   let camera = mountedCameras.get(parentElement);
   if (!camera) {
-    camera = { stream: null, devices: [], activeIndex: 0, stopped: false };
+    camera = {
+      stream: null,
+      devices: [],
+      activeIndex: 0,
+      stopped: false,
+      qualityTimer: null,
+      brightness: 0,
+      sharpness: 0,
+    };
     mountedCameras.set(parentElement, camera);
   }
 
   const stopStream = () => {
+    if (camera.qualityTimer) {
+      clearInterval(camera.qualityTimer);
+      camera.qualityTimer = null;
+    }
     if (camera.stream) {
       camera.stream.getTracks().forEach((track) => track.stop());
       camera.stream = null;
+    }
+  };
+
+  const updateQuality = () => {
+    if (!video.videoWidth || !video.videoHeight) return;
+    canvas.width = 160;
+    canvas.height = 120;
+    const context = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let light = 0;
+    let edges = 0;
+    let previous = 0;
+    const count = pixels.length / 4;
+    for (let i = 0; i < pixels.length; i += 4) {
+      const value = 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+      light += value;
+      if (i > 0) edges += Math.abs(value - previous);
+      previous = value;
+    }
+    camera.brightness = light / count;
+    camera.sharpness = edges / Math.max(1, count - 1);
+
+    if (camera.brightness < 58) {
+      quality.className = "quality warning";
+      quality.textContent = "Too dark — add light or move closer";
+    } else if (camera.sharpness < 5.5) {
+      quality.className = "quality warning";
+      quality.textContent = "Hold steady and tap the receipt to focus";
+    } else {
+      quality.className = "quality good";
+      quality.textContent = "Ready — lighting and focus look good";
     }
   };
 
@@ -178,6 +245,8 @@ export default function cameraComponent(component) {
       await listCameras();
       captureButton.disabled = false;
       status.hidden = true;
+      updateQuality();
+      camera.qualityTimer = setInterval(updateQuality, 650);
     } catch (error) {
       status.hidden = false;
       status.textContent = error?.name === "NotAllowedError"
@@ -194,7 +263,11 @@ export default function cameraComponent(component) {
     context.drawImage(video, 0, 0, canvas.width, canvas.height);
     status.hidden = false;
     status.textContent = "Photo captured. Preparing receipt…";
-    setTriggerValue("captured", canvas.toDataURL("image/jpeg", 0.94));
+    setTriggerValue("captured", {
+      dataUrl: canvas.toDataURL("image/jpeg", 0.94),
+      brightness: camera.brightness,
+      sharpness: camera.sharpness,
+    });
   };
 
   switchButton.onclick = async () => {
@@ -240,34 +313,148 @@ DATE_PATTERNS = [
     r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{2,4}\b",
 ]
 
-def preprocess(img: Image.Image) -> Image.Image:
-    """Fix phone rotation, resize, and enhance contrast without native CV libraries."""
-    img = ImageOps.exif_transpose(img).convert("L")
-    w, h = img.size
-    if max(h, w) < 1400:
-        s = 1400 / max(h, w)
-        img = img.resize(
-            (max(1, round(w * s)), max(1, round(h * s))),
-            Image.Resampling.LANCZOS,
-        )
-    elif max(h, w) > 2600:
-        s = 2600 / max(h, w)
-        img = img.resize(
-            (max(1, round(w * s)), max(1, round(h * s))),
-            Image.Resampling.LANCZOS,
-        )
-    return ImageOps.autocontrast(img, cutoff=1).filter(ImageFilter.SHARPEN)
+def _order_corners(points: np.ndarray) -> np.ndarray:
+    """Return quadrilateral corners as top-left, top-right, bottom-right, bottom-left."""
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    coordinate_sum = points.sum(axis=1)
+    coordinate_diff = np.diff(points, axis=1).ravel()
+    ordered[0] = points[np.argmin(coordinate_sum)]
+    ordered[2] = points[np.argmax(coordinate_sum)]
+    ordered[1] = points[np.argmin(coordinate_diff)]
+    ordered[3] = points[np.argmax(coordinate_diff)]
+    return ordered
 
 
-def ocr_lines(img: Image.Image):
-    """Run Tesseract and return words grouped into their detected text rows."""
+def _perspective_crop(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    corners = _order_corners(corners.astype(np.float32))
+    top_left, top_right, bottom_right, bottom_left = corners
+    width = int(
+        max(
+            np.linalg.norm(bottom_right - bottom_left),
+            np.linalg.norm(top_right - top_left),
+        )
+    )
+    height = int(
+        max(
+            np.linalg.norm(top_right - bottom_right),
+            np.linalg.norm(top_left - bottom_left),
+        )
+    )
+    if width < 200 or height < 300:
+        return image
+    destination = np.array(
+        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(corners, destination)
+    return cv2.warpPerspective(
+        image,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _find_receipt_corners(image: np.ndarray) -> np.ndarray | None:
+    """Find the largest plausible four-sided receipt boundary."""
+    height, width = image.shape[:2]
+    scale = min(1.0, 1600 / max(height, width))
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 45, 140)
+    edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+        iterations=2,
+    )
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    minimum_area = small.shape[0] * small.shape[1] * 0.12
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:15]:
+        if cv2.contourArea(contour) < minimum_area:
+            break
+        perimeter = cv2.arcLength(contour, True)
+        polygon = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
+        if len(polygon) == 4 and cv2.isContourConvex(polygon):
+            return polygon.reshape(4, 2).astype(np.float32) / scale
+    return None
+
+
+def _encode_preview(image: np.ndarray) -> bytes:
+    success, encoded = cv2.imencode(
+        ".jpg", cv2.cvtColor(image, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90]
+    )
+    if not success:
+        raise ValueError("Could not create the scanned receipt preview")
+    return encoded.tobytes()
+
+
+def preprocess(img: Image.Image) -> tuple[list[Image.Image], bytes, dict]:
+    """Detect, straighten, trim, and enhance a receipt for OCR."""
+    rgb = np.asarray(ImageOps.exif_transpose(img).convert("RGB"))
+    original_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    quality = {
+        "brightness": round(float(np.mean(original_gray)), 1),
+        "contrast": round(float(np.std(original_gray)), 1),
+        "sharpness": round(float(cv2.Laplacian(original_gray, cv2.CV_64F).var()), 1),
+        "cropped": False,
+    }
+
+    corners = _find_receipt_corners(rgb)
+    scanned = _perspective_crop(rgb, corners) if corners is not None else rgb
+    quality["cropped"] = corners is not None
+
+    height, width = scanned.shape[:2]
+    if max(height, width) < 1600:
+        scale = 1600 / max(height, width)
+        scanned = cv2.resize(
+            scanned, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+        )
+    elif max(height, width) > 2800:
+        scale = 2800 / max(height, width)
+        scanned = cv2.resize(
+            scanned, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+        )
+
+    gray = cv2.cvtColor(scanned, cv2.COLOR_RGB2GRAY)
+    gray = cv2.bilateralFilter(gray, 7, 45, 45)
+    enhanced = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
+    binary = cv2.adaptiveThreshold(
+        enhanced,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        41,
+        13,
+    )
+
+    warnings = []
+    if quality["brightness"] < 62:
+        warnings.append("The original photo was dark; add more light for better accuracy.")
+    if quality["sharpness"] < 55:
+        warnings.append("The photo may be blurred; hold the phone steady and refocus.")
+    if quality["contrast"] < 24:
+        warnings.append("The receipt has low contrast; avoid glare and shadows.")
+    if not quality["cropped"]:
+        warnings.append("Receipt edges were not confidently detected; fill more of the guide.")
+    quality["warnings"] = warnings
+
+    variants = [Image.fromarray(enhanced), Image.fromarray(binary)]
+    return variants, _encode_preview(scanned), quality
+
+
+def ocr_lines(img: Image.Image, page_mode: int = 6):
+    """Run Tesseract and return grouped rows plus a confidence score."""
     data = pytesseract.image_to_data(
         img,
         lang="eng",
-        config="--oem 1 --psm 6 -c preserve_interword_spaces=1",
+        config=f"--oem 1 --psm {page_mode} -c preserve_interword_spaces=1",
         output_type=Output.DICT,
     )
     grouped = {}
+    confidences = []
     for i, raw_text in enumerate(data["text"]):
         text = raw_text.strip()
         try:
@@ -276,6 +463,7 @@ def ocr_lines(img: Image.Image):
             confidence = -1
         if not text or confidence < 15:
             continue
+        confidences.append(confidence)
         key = (
             data["page_num"][i],
             data["block_num"][i],
@@ -303,7 +491,9 @@ def ocr_lines(img: Image.Image):
                 [(word["x"], word["text"]) for word in row],
             )
         )
-    return out
+    money_hits = sum(bool(MONEY.search(text)) for text, _ in out)
+    score = sum(confidences) + 18 * len(confidences) + 60 * money_hits
+    return out, score
 
 def find_date(lines):
     text = "\n".join(t for t, _ in lines)
@@ -407,17 +597,31 @@ def save(df: pd.DataFrame, fmt: str) -> Path:
         df.to_excel(path, index=False)
     return path
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=128)
 def process(data: bytes) -> dict:
-    arr = preprocess(Image.open(io.BytesIO(data)))
-    lines = ocr_lines(arr)
-    vendor, rows, total = parse_receipt(lines) if lines else ("", [], None)
+    variants, preview, quality = preprocess(Image.open(io.BytesIO(data)))
+    attempts = [
+        ocr_lines(variants[0], 6),
+        ocr_lines(variants[1], 6),
+        ocr_lines(variants[0], 4),
+    ]
+    candidates = []
+    for lines, ocr_score in attempts:
+        vendor, rows, total = parse_receipt(lines) if lines else ("", [], None)
+        items_total = sum(row["Price"] for row in rows)
+        total_matches = total is not None and abs(total - items_total) < 0.5
+        receipt_score = ocr_score + 180 * len(rows) + (600 if total_matches else 0)
+        candidates.append((receipt_score, lines, vendor, rows, total))
+
+    _, lines, vendor, rows, total = max(candidates, key=lambda candidate: candidate[0])
     return dict(
         vendor=vendor,
         rows=rows,
         total=total,
         date=find_date(lines) if lines else None,
         raw="\n".join(t for t, _ in lines),
+        preview=preview,
+        quality=quality,
     )
 
 # --- UI SETUP & CUSTOM STYLING ---
@@ -517,7 +721,8 @@ with tab_cam:
 
     if captured:
         try:
-            header, encoded = captured.split(",", 1)
+            payload = captured.get("dataUrl", "") if isinstance(captured, dict) else captured
+            header, encoded = payload.split(",", 1)
             if not header.startswith("data:image/"):
                 raise ValueError("Unexpected camera data")
             b = base64.b64decode(encoded, validate=True)
@@ -605,8 +810,19 @@ for h, (name, b) in batch.items():
     with st.expander(label, expanded=not ok):
         include = st.checkbox(f"Include {name} in final save", value=True, key=f"inc_{h}")
         
-        # Display image first on mobile (stacked)
-        st.image(Image.open(io.BytesIO(b)), width="stretch")
+        st.image(
+            Image.open(io.BytesIO(r["preview"])),
+            caption="Automatically detected and straightened scan",
+            width="stretch",
+        )
+
+        for warning in r["quality"]["warnings"]:
+            st.warning(warning, icon=":material/warning:")
+        if not r["quality"]["warnings"]:
+            st.success(
+                "Capture quality looks good and the receipt edges were detected.",
+                icon=":material/check_circle:",
+            )
         
         if not r["rows"]:
             st.error("No items detected. Try better lighting or add rows below.")
