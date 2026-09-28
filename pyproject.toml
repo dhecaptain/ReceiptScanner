@@ -1,0 +1,16 @@
+[project]
+name = "receipt-ocr"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "streamlit",
+    "rapidocr-onnxruntime",
+    "opencv-python-headless",
+    "pandas",
+    "openpyxl",
+    "python-dateutil",
+    "pillow",
+    "numpy",
+]

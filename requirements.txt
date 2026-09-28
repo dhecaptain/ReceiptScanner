@@ -1,0 +1,8 @@
+streamlit
+rapidocr-onnxruntime
+opencv-python-headless
+pandas
+openpyxl
+python-dateutil
+pillow
+numpy
