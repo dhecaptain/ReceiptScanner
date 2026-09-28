@@ -7,7 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "streamlit",
     "rapidocr-onnxruntime",
-    "opencv-python-headless",
     "pandas",
     "openpyxl",
     "python-dateutil",
